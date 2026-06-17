@@ -370,6 +370,15 @@ def _work_stealing_gmm(
         "Work stealing tiles-per-XCD count can't be negative (tiles_per_xcd < 0).",
     )
 
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS  # XCD mapping is round-robin
+
+    # There are NUM_XCDS + 1 atomic tile counters:
+    # > assigned XCD tile counter
+    xcd_tile_counter_ptr = tile_counter_ptr + xcd * TILE_COUNTER_STRIDE
+    # > last counter slot is global tile counter
+    global_tile_counter_ptr = tile_counter_ptr + NUM_XCDS * TILE_COUNTER_STRIDE
+
     # Total tiles in GMM. Tile processing loop condition is (tile < total_tiles).
     total_tiles = _total_gmm_tiles(
         group_sizes_ptr,
@@ -391,18 +400,11 @@ def _work_stealing_gmm(
     # The kernel starts in phase 1 and then proceeds to phase 2 when (tile >= xcd_phase_tiles).
     xcd_phase_tiles = tiles_per_xcd * NUM_XCDS
 
-    # There are NUM_XCDS + 1 atomic tile counters:
-    # > assigned XCD tile counter, XCD mapping is round-robin
-    xcd = tl.program_id(0) % NUM_XCDS
-    xcd_tile_counter_ptr = tile_counter_ptr + xcd * TILE_COUNTER_STRIDE
-    # > last counter slot is global tile counter
-    global_title_counter_ptr = tile_counter_ptr + NUM_XCDS * TILE_COUNTER_STRIDE
-
     # Claim first tile.
     xcd_tile = _inc(xcd_tile_counter_ptr)
     in_global_phase = xcd_tile >= tiles_per_xcd
     if in_global_phase:
-        global_tile = _inc(global_title_counter_ptr)
+        global_tile = _inc(global_tile_counter_ptr)
         tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
     else:
         tile = (xcd * tiles_per_xcd + xcd_tile).to(INT_TYPE)
@@ -446,14 +448,14 @@ def _work_stealing_gmm(
 
         # Claim next tile.
         if in_global_phase:
-            global_tile = _inc(global_title_counter_ptr)
+            global_tile = _inc(global_tile_counter_ptr)
             tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
         else:
             xcd_tile = _inc(xcd_tile_counter_ptr)
             if xcd_tile >= tiles_per_xcd:
                 # Transition from XCD phase to global phase.
                 in_global_phase = True
-                global_tile = _inc(global_title_counter_ptr)
+                global_tile = _inc(global_tile_counter_ptr)
                 tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
             else:
                 tile = (xcd * tiles_per_xcd + xcd_tile).to(INT_TYPE)
