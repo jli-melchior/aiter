@@ -114,6 +114,11 @@ def _gmm_grid(
     block_size_n: int,
     group_sizes: Tensor,
     grid_dim: int,
+    # Minimum number of programs to launch. Per-XCD work stealing requires at
+    # least one program per XCD residue class (i.e. `min_programs == _NUM_XCDS`):
+    # otherwise the per-XCD regions of the absent XCDs are never claimed and
+    # their output tiles are left untouched.
+    min_programs: int = 0,
     # Expensive assertions launch GPU kernels on `group_sizes` and dominate the
     # host-side launch cost. Only enable them in development.
     enable_expensive_assertions: bool = False,
@@ -128,6 +133,10 @@ def _gmm_grid(
     assert (
         grid_dim > 0
     ), f"Grid dimension (number of programs) must be positive (got {grid_dim})."
+    assert (
+        min_programs >= 0
+    ), f"Minimum number of programs must be non-negative (got {min_programs})."
+
     num_n_tiles = triton.cdiv(N, block_size_n)
 
     # Cheap-path default. The kernel handle the case where grid_dim exceeds the
@@ -146,6 +155,11 @@ def _gmm_grid(
             f"non-empty group (computed {num_tiles} total tiles)."
         )
         num_programs = int(min(grid_dim, num_tiles))
+
+    # Floor must be applied after the `min(grid_dim, num_tiles)` clamp above, so
+    # the clamp can't drop the program count below the per-XCD minimum. Extra
+    # programs (when this exceeds the tile count) just exit without doing work.
+    num_programs = max(num_programs, min_programs)
 
     return (num_programs,)
 
@@ -309,12 +323,25 @@ def gmm(
         config = dict(config)
         config["GRID_DIM"] = grid_dim
 
+    # Per-XCD work stealing partitions the per-XCD phase tiles across all
+    # _NUM_XCDS XCD residue classes, so each XCD must have at least one program
+    # claiming its region. Floor the program count to _NUM_XCDS in that case.
+    # The global mode drains every tile from a single counter, so it's correct
+    # for any grid size and needs no floor.
+    resolved_ws_mode: str = (
+        "global" if work_stealing_mode is None else work_stealing_mode
+    )
+    min_programs: int = (
+        _NUM_XCDS if (work_stealing and resolved_ws_mode == "per_xcd") else 0
+    )
+
     grid = _gmm_grid(
         N,
         config["BLOCK_SIZE_M"],
         config["BLOCK_SIZE_N"],
         group_sizes,
         config["GRID_DIM"],
+        min_programs=min_programs,
     )
 
     tile_counter: Tensor | None
@@ -327,7 +354,7 @@ def gmm(
             config["BLOCK_SIZE_M"],
             config["BLOCK_SIZE_N"],
             config["GRID_DIM"],
-            mode="global" if work_stealing_mode is None else work_stealing_mode,
+            mode=resolved_ws_mode,
         )
     else:
         tile_counter, tiles_per_xcd = None, None
