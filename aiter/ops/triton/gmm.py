@@ -74,8 +74,17 @@ def _gmm_tiles_per_xcd(
     block_size_m: int,
     block_size_n: int,
     grid_dim: int,
-    mode: Literal["per_xcd", "hierarchical", "global"] = "global",
+    mode: Literal["global", "per_xcd"] = "global",
 ) -> int:
+    assert mode in (
+        "global",
+        "per_xcd",
+    ), f"GMM tiles per XCD work stealing mode must be in {{'global', 'per_xcd'}} (got '{mode}')."
+
+    if mode == "global":
+        return 0
+
+    assert mode == "per_xcd"
     assert M > 0, f"Number of lhs/out rows M must be positive (got M = {M})."
     assert N > 0, f"Number of output columns N must be positive (got N = {N})."
     assert is_power_of_2(
@@ -87,18 +96,16 @@ def _gmm_tiles_per_xcd(
     assert (
         grid_dim > 0
     ), f"Grid dimension (number of programs) must be positive (got {grid_dim})."
-    if mode == "global":
-        return 0
+
     num_n_tiles = triton.cdiv(N, block_size_n)
-    num_m_tiles = triton.cdiv(M, block_size_m)  # estimate for number of tiles in M
+    # Estimate the number of tiles in M-dimension as the uniform group sizes case.
+    # Otherwise, we need to do ceiling division by `block_size_m` on every group size and
+    # then sum over the product of it with `num_n_tiles` (as done in `_gmm_grid`, check
+    # `if enable_expensive_assertions:` branch.
+    num_m_tiles = triton.cdiv(M, block_size_m)
     num_tiles = num_m_tiles * num_n_tiles
     tiles_per_xcd = triton.cdiv(num_tiles, _NUM_XCDS)
-    if mode == "per_xcd":
-        return tiles_per_xcd
-    if mode == "hierarchical":
-        tiles_per_cu = num_tiles / grid_dim
-        # TODO: Implement adaptative split based on `tiles_per_cu`.
-        return 0
+    return tiles_per_xcd
 
 
 def _gmm_grid(
@@ -151,6 +158,7 @@ def gmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
     work_stealing: bool = False,
+    work_stealing_mode: Literal["global", "per_xcd"] | None = None,
     config: dict[str, int] | None = None,
     grid_dim: int | None = None,
 ) -> Tensor:
@@ -202,6 +210,13 @@ def gmm(
     work_stealing : bool, defaults to False
         Enable work stealing, i.e. dynamic load-balancing where CUs with no assigned tiles "steal"
         the next available tile to be computed.
+    work_stealing_mode : Literal["global", "per_xcd"] or None, optional
+        Work stealing behavior with respect to atomic synchronization. In "global" mode, all work
+        groups fetch the next tile from a shared atomic counter. In "per_xcd" mode, we have XCDs + 1
+        atomic counters: the work groups start fetching from a per-XCD shared counter and then
+        proceed to the global counter to drain the remaining tiles.
+        This argument only makes sense when `work_stealing` is True. If `work_stealing` is True and
+        `work_stealing_mode` is None, fall-back to "global" behavior.
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
@@ -307,7 +322,12 @@ def gmm(
     if work_stealing:
         tile_counter = _get_gmm_tile_counter(lhs.device)
         tiles_per_xcd = _gmm_tiles_per_xcd(
-            M, N, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["GRID_DIM"]
+            M,
+            N,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["GRID_DIM"],
+            mode="global" if work_stealing_mode is None else work_stealing_mode,
         )
     else:
         tile_counter, tiles_per_xcd = None, None
