@@ -2102,12 +2102,15 @@ _DEFAULT_COMPILE_HINTS = {
 def hca_per_n_config_gfx1250(plan_capacity: int) -> tuple[int, int]:
     """Return ``(slice_size, k_split_num_waves)`` for gfx1250 HCA.
 
-    Initial values -- need hardware tuning.
+    Tuned on gfx1250 (256 CU, 1024 VGPR/SIMD, 320 KB LDS/CU).
+    SL=128 NW=8 (VEC=4, dwordx4) is the sweet spot for mid-range
+    plan_capacity: widest single-instruction load while keeping enough
+    blocks (576 at plan_cap=144) to fill the CUs.
     """
     if plan_capacity <= 64:
         return 32, 8
     if plan_capacity <= 256:
-        return 64, 8
+        return 128, 8
     if plan_capacity <= 1024:
         return 256, 4
     return 512, 1
