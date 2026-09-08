@@ -27,6 +27,7 @@ from flydsl.expr.arith import CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
 
 from .communication_ops_utils import atomic_add_agent
 from .fused_compress_attn_common import (
@@ -55,6 +56,7 @@ def _build_compress_forward_kernel(
     k_split_num_waves: int = 8,
     slice_size: int = 64,
     enable_prefetch_input: bool = False,
+    enable_tdm: bool = False,
 ):
     """HCA compress_forward with K-axis parallelized across multiple waves.
 
@@ -103,6 +105,9 @@ def _build_compress_forward_kernel(
         ratio % k_split_num_waves == 0
     ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
     assert state_size >= ratio, f"state_size={state_size} must be >= K={ratio}"
+    assert not (
+        enable_tdm and enable_prefetch_input
+    ), "TDM and prefetch are mutually exclusive for now"
     D = head_dim
     K = ratio
     DIM_FULL = D
@@ -118,13 +123,26 @@ def _build_compress_forward_kernel(
     LDS_KV_ELEMS = NW * SLICE_SZ
     LDS_W_ELEMS = NW * SLICE_SZ
 
-    @fx.struct
-    class SharedStorage:
-        lds_m: fx.Array[fx.Float32, LDS_M_ELEMS, 16]
-        lds_kv: fx.Array[fx.Float32, LDS_KV_ELEMS, 16]
-        lds_w: fx.Array[fx.Float32, LDS_W_ELEMS, 16]
+    if enable_tdm:
+        KV_DB_TOTAL = K * SLICE_SZ
 
-    _kname = f"hca_compress_forward_w32_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
+        @fx.struct
+        class SharedStorage:
+            lds_kv_db: fx.Array[fx.BFloat16, KV_DB_TOTAL, 16]
+            lds_m: fx.Array[fx.Float32, LDS_M_ELEMS, 16]
+            lds_kv: fx.Array[fx.Float32, LDS_KV_ELEMS, 16]
+            lds_w: fx.Array[fx.Float32, LDS_W_ELEMS, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            lds_m: fx.Array[fx.Float32, LDS_M_ELEMS, 16]
+            lds_kv: fx.Array[fx.Float32, LDS_KV_ELEMS, 16]
+            lds_w: fx.Array[fx.Float32, LDS_W_ELEMS, 16]
+
+    _tdm_tag = "_TDM" if enable_tdm else ""
+    _kname = f"hca_compress_forward_w32_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}{_tdm_tag}_flydsl"
     fm_fast = arith.FastMathFlags.fast
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_TH, 1, 1])
@@ -205,6 +223,8 @@ def _build_compress_forward_kernel(
                 base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
+
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
             def _load_bf16_vec_to_f32(rsrc, base_off_elems_i32):
                 """Load VEC contiguous bf16 elements starting at
@@ -307,12 +327,48 @@ def _build_compress_forward_kernel(
                 in_row_raw = fx.Int32(ragged_id) - (fx.Int32(K - 1) - k)
                 in_row = fx.max(in_row_raw, fx.Int32(0))
                 base_in_off = in_row * fx.Int32(kv_in_row_stride) + col_off_base
-                base_sc_off = in_row * fx.Int32(score_in_row_stride) + col_off_base
-                base_ape_off = ape_row * DIM_FULL + col_off_base
                 kv = _load_bf16_vec_to_f32(kv_in_rsrc, base_in_off)
+                base_sc_off = in_row * fx.Int32(score_in_row_stride) + col_off_base
                 sc = _load_bf16_vec_to_f32(score_in_rsrc, base_sc_off)
+                base_ape_off = ape_row * DIM_FULL + col_off_base
                 ape_v = _load_f32_vec(ape_rsrc, base_ape_off)
                 return kv, sc, ape_v
+
+            def _issue_score_ape_loads(k_i32):
+                """Phase 2 score + APE loads only (kv comes from LDS in TDM
+                mode). Returns (sc_list, ape_list) each of length VEC."""
+                k = fx.Int32(k_i32)
+                in_row_raw = fx.Int32(ragged_id) - (fx.Int32(K - 1) - k)
+                in_row = fx.max(in_row_raw, fx.Int32(0))
+                base_sc_off = in_row * fx.Int32(score_in_row_stride) + col_off_base
+                sc = _load_bf16_vec_to_f32(score_in_rsrc, base_sc_off)
+                ape_row = fx.Int32((fx.Uint32(k_i32) % ratio).ir_value())
+                base_ape_off = ape_row * DIM_FULL + col_off_base
+                ape_v = _load_f32_vec(ape_rsrc, base_ape_off)
+                return sc, ape_v
+
+            def _read_kv_from_lds(k_i32, q_lo, buf_base):
+                """Read VEC bf16 kv values from TDM double-buffered LDS."""
+                k = fx.Int32(k_i32)
+                lds_row = k - fx.Int32(q_lo)
+                lds_off = fx.Int32(buf_base) + lds_row * SLICE_SZ + lid * VEC
+                if const_expr(VEC >= 2):
+                    lds_off_dw = fx.Int32((fx.Uint32(lds_off) >> 1).ir_value())
+                    kv_lds_i32 = fx.recast_iter(fx.Int32, kv_db_ptr)
+                    raw_vec = fx.Vector(
+                        fx.ptr_load(
+                            fx.add_offset(kv_lds_i32, lds_off_dw),
+                            T.vec(VEC // 2, T.i32),
+                        )
+                    )
+                    vec_bf16 = raw_vec.bitcast(fx.BFloat16)
+                    return [vec_bf16[i].to(fx.Float32).ir_value() for i in range(VEC)]
+                else:
+                    result = []
+                    for _vi in range_constexpr(VEC):
+                        bf16_v = fx.ptr_load(kv_db_ptr + (lds_off + _vi))
+                        result.append(bf16_v.to(fx.Float32).ir_value())
+                    return result
 
             def _issue_phase1_loads(k_i32):
                 """Phase 1 (state cache) loads. Returns (kv_list, sc_padded_list)
@@ -373,6 +429,37 @@ def _build_compress_forward_kernel(
                     new_m.append(m_new)
                 return new_m, new_kv, new_w
 
+            # -- TDM: pipelined kv_in double-buffer (Q0 issued now) --------
+            if const_expr(enable_tdm):
+                tdm_first_row = fx.max(
+                    fx.Int32(ragged_id) - fx.Int32(K - 1), fx.Int32(0)
+                )
+                kv_db_ptr = lds.lds_kv_db.ptr
+
+                col_start_idx = arith.index_cast(
+                    T.index, (fx.Int32(sid) * SLICE_SZ).ir_value()
+                )
+
+                kv_db_view = fx.Tensor(
+                    fx.make_view(
+                        kv_db_ptr,
+                        fx.make_layout((K, SLICE_SZ), (SLICE_SZ, 1)),
+                    )
+                )
+
+                q0_row_idx = arith.index_cast(T.index, tdm_first_row.ir_value())
+                tdm_desc = tdm_ops.make_tensor_descriptor_2d(
+                    global_ptr=kv_in,
+                    lds_memref=kv_db_view,
+                    global_offset=(q0_row_idx, col_start_idx),
+                    tensor_shape=(K, D),
+                    strides=(kv_in_row_stride, 1),
+                    tile_shape=(K, SLICE_SZ),
+                    elem_bytes=2,
+                    num_warps=NW,
+                )
+                tdm_ops.tensor_load_2d(tdm_desc)
+
             # -- Wave's K range: [wid * K_PER_WAVE, (wid+1) * K_PER_WAVE) --
             k_start_i32 = wid * K_PER_WAVE
             k_end_i32 = k_start_i32 + K_PER_WAVE
@@ -411,11 +498,101 @@ def _build_compress_forward_kernel(
                 )
                 phase1_local = yield list(new_m) + list(new_kv) + list(new_w)
 
-            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input;
-            # uses padded softmax (the is-pad-score branch is dead code
-            # since Phase 2 scores are always finite -- compiler elides).
+            # TDM: wait for kv_in tile to land in LDS before Phase 2 reads.
+            if const_expr(enable_tdm):
+                tdm_ops.tensor_wait(0)
+                fx.rocdl.s_wait_dscnt(0)
+                gpu.barrier()
+
+            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input.
             # Carry Phase 1's accumulator through as init.
-            if const_expr(not enable_prefetch_input):
+            if const_expr(enable_tdm):
+                _p2_count = fx.max(k_end_i32 - split_i32, fx.Int32(0))
+                _p2_even = fx.Int32((fx.Uint32(_p2_count.ir_value()) & ~1).ir_value())
+                _k_end_u2 = split_i32 + _p2_even
+
+                _k_pro0 = split_i32
+                _k_pro1 = split_i32 + 1
+                _pf0_sc, _pf0_ape = _issue_score_ape_loads(_k_pro0)
+                _pf1_sc, _pf1_ape = _issue_score_ape_loads(_k_pro1)
+                _pf_init = (
+                    list(phase1_local)
+                    + list(_pf0_sc)
+                    + list(_pf0_ape)
+                    + list(_pf1_sc)
+                    + list(_pf1_ape)
+                )
+
+                _loop_final = _pf_init
+                for k_static, state in range(
+                    split_i32.ir_value(),
+                    _k_end_u2.ir_value(),
+                    2,
+                    init=_pf_init,
+                ):
+                    m_lane = list(state[0:VEC])
+                    kv_lane = list(state[VEC : 2 * VEC])
+                    w_lane = list(state[2 * VEC : 3 * VEC])
+                    pf0_sc = list(state[3 * VEC : 4 * VEC])
+                    pf0_ape = list(state[4 * VEC : 5 * VEC])
+                    pf1_sc = list(state[5 * VEC : 6 * VEC])
+                    pf1_ape = list(state[6 * VEC : 7 * VEC])
+
+                    k_i32 = fx.Int32(k_static)
+                    nxt0_sc, nxt0_ape = _issue_score_ape_loads(k_i32 + 2)
+                    nxt1_sc, nxt1_ape = _issue_score_ape_loads(k_i32 + 3)
+
+                    kv_a = _read_kv_from_lds(k_i32, 0, 0)
+                    sc_a = [
+                        arith.AddFOp(pf0_sc[i], pf0_ape[i], fastmath=fm_fast).result
+                        for i in range(VEC)
+                    ]
+                    m_a, kv_a_acc, w_a = _softmax_step_padded(
+                        m_lane, kv_lane, w_lane, sc_a, kv_a
+                    )
+
+                    kv_b = _read_kv_from_lds(k_i32 + 1, 0, 0)
+                    sc_b = [
+                        arith.AddFOp(pf1_sc[i], pf1_ape[i], fastmath=fm_fast).result
+                        for i in range(VEC)
+                    ]
+                    m_b, kv_b_acc, w_b = _softmax_step_padded(
+                        m_a, kv_a_acc, w_a, sc_b, kv_b
+                    )
+                    _loop_final = yield (
+                        list(m_b)
+                        + list(kv_b_acc)
+                        + list(w_b)
+                        + list(nxt0_sc)
+                        + list(nxt0_ape)
+                        + list(nxt1_sc)
+                        + list(nxt1_ape)
+                    )
+
+                _tail_carry = list(_loop_final[0 : 3 * VEC])
+                _tail_final = _tail_carry
+                for _tk_static, _tstate in range(
+                    _k_end_u2.ir_value(),
+                    k_end_i32.ir_value(),
+                    1,
+                    init=_tail_carry,
+                ):
+                    _tm = list(_tstate[0:VEC])
+                    _tkv = list(_tstate[VEC : 2 * VEC])
+                    _tw = list(_tstate[2 * VEC : 3 * VEC])
+                    _tk = fx.Int32(_tk_static)
+                    _tkv_lds = _read_kv_from_lds(_tk, 0, 0)
+                    _tsc, _tape = _issue_score_ape_loads(_tk)
+                    _tscore = [
+                        arith.AddFOp(_tsc[i], _tape[i], fastmath=fm_fast).result
+                        for i in range(VEC)
+                    ]
+                    _tnm, _tnkv, _tnw = _softmax_step_padded(
+                        _tm, _tkv, _tw, _tscore, _tkv_lds
+                    )
+                    _tail_final = yield (list(_tnm) + list(_tnkv) + list(_tnw))
+                final = list(_tail_final)
+            elif const_expr(not enable_prefetch_input):
                 final = phase1_local
                 for k_static, state in range(
                     split_i32.ir_value(), k_end_i32.ir_value(), 1, init=phase1_local
@@ -563,7 +740,6 @@ def _build_compress_forward_kernel(
             # Layout: per array, NW * SLICE_SZ fp32 entries; per-thread
             # base = wid * SLICE_SZ + lid * VEC; thread writes VEC values
             # at base+0, base+1, ..., base+VEC-1.
-            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             lds_m_ptr = lds.lds_m.ptr
             lds_kv_ptr = lds.lds_kv.ptr
             lds_w_ptr = lds.lds_w.ptr
@@ -2738,6 +2914,7 @@ def compile_hca_compress_forward_gfx1250(
     k_split_num_waves: int = 8,
     slice_size: int = 64,
     enable_prefetch_input: bool = True,
+    enable_tdm: bool = False,
 ):
     """Build the HCA compress_forward launcher (multi-wave LDS K-split).
 
@@ -2756,6 +2933,9 @@ def compile_hca_compress_forward_gfx1250(
     ``enable_prefetch_input``: when True, Phase 2 uses single-iter prefetch
     to overlap memory latency with softmax compute.
 
+    ``enable_tdm``: when True, Phase 2 kv_in loads use TDM async DMA
+    (Global -> LDS) instead of wavefront buffer_load.
+
     ``state_size`` is the ring-buffer modulo of ``kv_state.shape[1]`` (>= ratio).
     """
     launcher = _build_compress_forward_kernel(
@@ -2765,6 +2945,7 @@ def compile_hca_compress_forward_gfx1250(
         k_split_num_waves=k_split_num_waves,
         slice_size=slice_size,
         enable_prefetch_input=enable_prefetch_input,
+        enable_tdm=enable_tdm,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
